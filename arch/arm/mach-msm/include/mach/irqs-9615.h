@@ -21,7 +21,6 @@
  * 32+:   SPI (shared peripheral interrupts)
  */
 
-#define FIQ_START     16
 #define GIC_PPI_START 16
 #define GIC_SPI_START 32
 

@@ -36,6 +36,10 @@ int hdmi_audio_enable(bool on , u32 fifo_water_mark);
 int hdmi_audio_packet_enable(bool on);
 void hdmi_msm_audio_sample_rate_reset(int rate);
 int hdmi_msm_audio_get_sample_rate(void);
+#ifdef CONFIG_LGE_COMPRESSED_PATH        //dongwook.lee
+void hdmi_msm_samplingrate_setting(int sampling_rate);
+int hdmi_msm_audio_is_enabled(void);		//keyman
+#endif
 
 #ifdef CONFIG_FB_MSM_HDMI_MSM_PANEL
 int hdmi_msm_audio_info_setup(bool enabled, u32 num_of_channels,
