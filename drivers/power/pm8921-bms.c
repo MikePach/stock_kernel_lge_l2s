@@ -28,6 +28,21 @@
 #include <linux/delay.h>
 #include <linux/mutex.h>
 
+#ifdef CONFIG_LGE_PM
+#include <mach/board_lge.h>
+#include <linux/mfd/pm8xxx/pm8921-charger.h>
+#endif
+
+#if defined(CONFIG_MACH_MSM8960_L0) || defined(CONFIG_MACH_MSM8960_L1A)||defined(CONFIG_MACH_MSM8960_L2S)
+#define BMS_SOC_INFO
+#endif
+
+/* L0/L1A, bms_soc_averaging
+ * BMS the number of averaging unit
+ * 2012-04-22, hyemin.cho@lge.com
+ */
+#define I_MAX 30
+
 #define BMS_CONTROL		0x224
 #define BMS_S1_DELAY		0x225
 #define BMS_OUTPUT0		0x230
@@ -46,6 +61,17 @@
 #define ADC_ARB_BMS_CNTRL	0x18D
 #define AMUX_TRIM_2		0x322
 #define TEST_PROGRAM_REV	0x339
+
+
+/* L0/L1A, bms_soc_logging
+ * Workaround for BMS error Debugging
+ * 2012-03-30, hyemin.cho@lge.com
+ */
+#ifdef BMS_SOC_INFO
+#define BMS_SOC_INFORM_TIME 10000
+#endif
+
+extern void pm8921_charger_force_update_batt_psy(void);
 
 enum pmic_bms_interrupts {
 	PM8921_BMS_SBI_WRITE_OK,
@@ -101,6 +127,9 @@ struct pm8921_bms_chip {
 	int			delta_rbatt_mohm;
 	struct work_struct	calib_hkadc_work;
 	struct delayed_work	calib_ccadc_work;
+#ifdef BMS_SOC_INFO
+	struct delayed_work	bms_soc_work;/*2012-03-30 bms_soc_logging hyemin.cho@lge.com*/
+#endif
 	unsigned int		calib_delay_ms;
 	unsigned int		revision;
 	unsigned int		xoadc_v0625_usb_present;
@@ -132,10 +161,13 @@ struct pm8921_bms_chip {
 	unsigned int		rconn_mohm;
 	struct mutex		last_ocv_uv_mutex;
 	int			last_ocv_uv;
-	int			last_cc_uah; /* used for Iavg calc for UUC */
+	int			last_cc_uah;
 	struct timeval		t;
 	int			last_uuc_uah;
 	int			enable_fcc_learning;
+	int			timer_uuc_expired;
+	struct delayed_work	uuc_timer_work;
+	int			uuc_uah_iavg_prev;
 };
 
 static struct pm8921_bms_chip *the_chip;
@@ -156,6 +188,10 @@ static int last_rbatt = -EINVAL;
 static int last_soc = -EINVAL;
 static int last_real_fcc_mah = -EINVAL;
 static int last_real_fcc_batt_temp = -EINVAL;
+
+#ifdef CONFIG_LGE_PM
+static int cntSOC = 0;
+#endif
 
 static int bms_ops_set(const char *val, const struct kernel_param *kp)
 {
@@ -346,6 +382,39 @@ static int usb_chg_plugged_in(void)
 
 	return ret.intval;
 }
+
+/* Add DC charger(TA) information in hkadc calibration.
+ *  LG use "ac" as power supply name in TA. But QCT use "usb" in both TA and USB.
+ *  2012-06-09, junsin.park@lge.com
+ */
+#ifdef CONFIG_LGE_PM
+static int dc_chg_plugged_in(void)
+{
+	union power_supply_propval ret = {0,};
+	static struct power_supply *psy;
+
+	if (psy == NULL) {
+		psy = power_supply_get_by_name("ac");
+		if (psy == NULL)
+			return 0;
+	}
+
+	if (psy->get_property(psy, POWER_SUPPLY_PROP_ONLINE, &ret))
+		return 0;
+
+	return ret.intval;
+}
+
+static int chg_plugged_in(void)
+{
+	int rc=0;
+
+	if(usb_chg_plugged_in()||dc_chg_plugged_in())
+		rc=1;
+
+	return rc;
+}
+#endif
 
 #define HOLD_OREG_DATA		BIT(1)
 static int pm_bms_lock_output_data(struct pm8921_bms_chip *chip)
@@ -880,8 +949,11 @@ int pm8921_bms_get_simultaneous_battery_voltage_and_current(int *ibat_ua,
 
 	mutex_unlock(&the_chip->bms_output_lock);
 
+#ifdef CONFIG_LGE_PM
+	usb_chg = chg_plugged_in();
+#else /* QCT original */
 	usb_chg = usb_chg_plugged_in();
-
+#endif
 	convert_vbatt_raw_to_uv(the_chip, usb_chg, vbat_raw, vbat_uv);
 	convert_vsense_to_uv(the_chip, vsense_raw, &vsense_uv);
 	*ibat_ua = vsense_uv * 1000 / (int)the_chip->r_sense;
@@ -912,7 +984,11 @@ static int read_rbatt_params_raw(struct pm8921_bms_chip *chip,
 	pm_bms_unlock_output_data(chip);
 	mutex_unlock(&chip->bms_output_lock);
 
+#ifdef CONFIG_LGE_PM
+	usb_chg = chg_plugged_in();
+#else /* QCT original */
 	usb_chg = usb_chg_plugged_in();
+#endif
 	convert_vbatt_raw_to_uv(chip, usb_chg,
 			raw->vbatt_for_rbatt_raw, &raw->vbatt_for_rbatt_uv);
 	convert_vbatt_raw_to_uv(chip, usb_chg,
@@ -957,8 +1033,11 @@ static int read_soc_params_raw(struct pm8921_bms_chip *chip,
 	pm_bms_unlock_output_data(chip);
 	mutex_unlock(&chip->bms_output_lock);
 
-	usb_chg =  usb_chg_plugged_in();
-
+#ifdef CONFIG_LGE_PM
+	usb_chg = chg_plugged_in();
+#else /* QCT original */
+	usb_chg = usb_chg_plugged_in();
+#endif
 	if (chip->prev_last_good_ocv_raw == 0) {
 		chip->prev_last_good_ocv_raw = raw->last_good_ocv_raw;
 		adjust_pon_ocv_raw(chip, raw);
@@ -1168,49 +1247,128 @@ static int calculate_uuc_uah_at_given_current(struct pm8921_bms_chip *chip,
 	return uuc;
 }
 
-/* soc_rbatt when uuc_reported should be equal to uuc_now */
-#define SOC_RBATT_CHG		80
-#define SOC_RBATT_DISCHG	10
-static int calculate_unusable_charge_uah(struct pm8921_bms_chip *chip,
-				int rbatt, int fcc_uah, int cc_uah,
-				int soc_rbatt, int batt_temp, int chargecycles)
+#define SOC_RBATT_CHG		70
+#define SOC_RBATT_DISCHG	20
+
+static int uuc_iavg_div = 150;
+module_param(uuc_iavg_div, int, 0644);
+
+static int uuc_min_step_size = 120;
+module_param(uuc_min_step_size, int, 0644);
+
+static int uuc_multiplier = 1000;
+module_param(uuc_multiplier, int, 0644);
+
+#define UUC_TIMER_MS		120000
+
+static void uuc_timer_work(struct work_struct *work)
 {
-	struct timeval now;
-	int delta_time_s;
+	struct pm8921_bms_chip *chip = container_of(work,
+				struct pm8921_bms_chip, uuc_timer_work.work);
+
+	pr_debug("UUC Timer expired\n");
+	/* indicates the system is done with the high load during bootup */
+	chip->timer_uuc_expired = 1;
+}
+
+static void calculate_iavg_ua(struct pm8921_bms_chip *chip, int cc_uah,
+				int *iavg_ua, int *delta_time_us)
+{
 	int delta_cc_uah;
-	int iavg_ua, iavg_ma;
-	int uuc_uah_itest, uuc_uah_iavg, uuc_now, uuc_reported;
-	s64 stepsize = 0;
-	int firsttime = 0;
+	struct timeval now;
 
 	delta_cc_uah = cc_uah - chip->last_cc_uah;
 	do_gettimeofday(&now);
 	if (chip->t.tv_sec != 0) {
-		delta_time_s = (now.tv_sec - chip->t.tv_sec);
+		*delta_time_us = (now.tv_sec - chip->t.tv_sec) * USEC_PER_SEC
+				+ now.tv_usec - chip->t.tv_usec;
 	} else {
-		/* uuc calculation for the first time */
-		delta_time_s = 0;
-		firsttime = 1;
+		/* calculation for the first time */
+		*delta_time_us = 0;
 	}
 
-	if (delta_time_s != 0)
-		iavg_ua = div_s64((s64)delta_cc_uah * 3600, delta_time_s);
+	if (*delta_time_us != 0)
+		*iavg_ua = div_s64((s64)delta_cc_uah * 3600 * 1000000,
+					*delta_time_us);
 	else
-		iavg_ua = 0;
+		*iavg_ua = 0;
 
-	iavg_ma = iavg_ua/1000;
+	pr_debug("t.tv_sec = %d, now.tv_sec = %d delta_us = %d iavg_ua = %d\n",
+				(int)chip->t.tv_sec, (int)now.tv_sec,
+				*delta_time_us, (int)*iavg_ua);
+	/* remember cc_uah */
+	chip->last_cc_uah = cc_uah;
 
-	pr_debug("t.tv_sec = %d, now.tv_sec = %d\n", (int)chip->t.tv_sec,
-				(int)now.tv_sec);
+	/* remember this time */
+	chip->t = now;
+}
 
-	pr_debug("delta_time_s = %d iavg_ma = %d\n", delta_time_s, iavg_ma);
+#define UUC_IAVG_THRESHOLD_UAH	50000
+static int scale_unusable_charge_uah(struct pm8921_bms_chip *chip,
+			bool charging, int uuc_uah_iavg, int uuc_uah_itest,
+			int uuc_uah_iavg_prev)
+{
+	int stepsize = 0;
+	int delta_uuc = 0;
+	int uuc_reported = 0;
 
-	if (iavg_ma == 0) {
-		pr_debug("Iavg = 0 returning last uuc = %d\n",
-				chip->last_uuc_uah);
-		uuc_reported = chip->last_uuc_uah;
-		goto out;
+	if (charging) {
+		stepsize = max(uuc_min_step_size,
+				uuc_multiplier * (SOC_RBATT_CHG - last_soc));
+		/*
+		 * set the delta only if uuc is decreasing. If it has increased
+		 * simply report the last uuc since we don't want to report a
+		 * higher uuc as charging progresses
+		 */
+		if (chip->last_uuc_uah > uuc_uah_iavg)
+			delta_uuc = (chip->last_uuc_uah - uuc_uah_iavg)
+								/ stepsize;
+		uuc_reported = chip->last_uuc_uah - delta_uuc;
+	} else {
+		stepsize = max(uuc_min_step_size,
+			uuc_multiplier * (last_soc - SOC_RBATT_DISCHG));
+		if (uuc_uah_itest > uuc_uah_iavg) {
+			if ((uuc_uah_iavg > uuc_uah_iavg_prev
+						+ UUC_IAVG_THRESHOLD_UAH)
+				&& chip->timer_uuc_expired)
+				/*
+				 * there is a big jump in iavg current way past
+				 * the bootup increase  uuc to this high iavg
+				 * based uuc in steps
+				 */
+				delta_uuc = (uuc_uah_iavg - uuc_uah_iavg_prev)
+							/ uuc_iavg_div;
+			else
+				/* increase uuc towards itest based uuc */
+				delta_uuc = (uuc_uah_itest - uuc_uah_iavg)
+						/ stepsize;
+		} else {
+			/*
+			 * the iavg based uuc was higher than itest based
+			 * uuc. This means that iavg > itest. Itest represents
+			 * the max current drawn from the device at anytime.
+			 * If we find iavg > itest, ignore iavg and simply step
+			 * up the uuc based on itest
+			 */
+			delta_uuc = uuc_uah_itest / stepsize;
+		}
+		uuc_reported = min(uuc_uah_itest,
+					chip->last_uuc_uah + delta_uuc);
 	}
+	pr_debug("uuc_prev = %d stepsize = %d d_uuc =  %d uuc_reported = %d\n",
+			chip->last_uuc_uah, (int)stepsize, delta_uuc,
+			uuc_reported);
+	return uuc_reported;
+}
+
+static int calculate_unusable_charge_uah(struct pm8921_bms_chip *chip,
+				int rbatt, int fcc_uah, int cc_uah,
+				int soc_rbatt, int batt_temp, int chargecycles,
+				int iavg_ua)
+{
+	int uuc_uah_itest, uuc_uah_iavg, uuc_reported;
+	static int firsttime = 1;
+	int iavg_ma = iavg_ua / 1000;
 
 	/* calculate unusable charge with itest */
 	uuc_uah_itest = calculate_uuc_uah_at_given_current(chip,
@@ -1227,6 +1385,8 @@ static int calculate_unusable_charge_uah(struct pm8921_bms_chip *chip,
 	pr_debug("iavg = %d uuc_iavg = %d\n", iavg_ma, uuc_uah_iavg);
 
 	if (firsttime) {
+		chip->uuc_uah_iavg_prev = uuc_uah_iavg;
+
 		if (cc_uah < chip->last_cc_uah)
 			chip->last_uuc_uah = uuc_uah_itest;
 		else
@@ -1234,45 +1394,21 @@ static int calculate_unusable_charge_uah(struct pm8921_bms_chip *chip,
 		pr_debug("firsttime uuc_prev = %d\n", chip->last_uuc_uah);
 	}
 
-	uuc_now = min(uuc_uah_itest, uuc_uah_iavg);
+	uuc_reported = scale_unusable_charge_uah(chip,
+				cc_uah < chip->last_cc_uah,
+				uuc_uah_iavg, uuc_uah_itest,
+				chip->uuc_uah_iavg_prev);
 
-	uuc_reported = -EINVAL;
-	if (cc_uah < chip->last_cc_uah) {
-		/* charging */
-		if (uuc_now < chip->last_uuc_uah) {
-			stepsize = max(1, (SOC_RBATT_CHG - soc_rbatt));
-			/* uuc_reported = uuc_prev + deltauuc / stepsize */
-			uuc_reported = div_s64 (stepsize * chip->last_uuc_uah
-					+ (uuc_now - chip->last_uuc_uah),
-					stepsize);
-			uuc_reported = max(0, uuc_reported);
-		}
-	} else {
-		if (uuc_now > chip->last_uuc_uah) {
-			stepsize = max(1, (soc_rbatt - SOC_RBATT_DISCHG));
-			/* uuc_reported = uuc_prev + deltauuc / stepsize */
-			uuc_reported = div_s64 (stepsize * chip->last_uuc_uah
-					+ (uuc_now - chip->last_uuc_uah),
-					stepsize);
-			uuc_reported = max(0, uuc_reported);
-		}
-	}
-	if (uuc_reported == -EINVAL)
-		uuc_reported = chip->last_uuc_uah;
+	/* remember the last uuc_uah_iavg */
+	chip->uuc_uah_iavg_prev = uuc_uah_iavg;
 
-	pr_debug("uuc_now = %d uuc_prev = %d stepsize = %d uuc_reported = %d\n",
-			uuc_now, chip->last_uuc_uah, (int)stepsize,
-			uuc_reported);
-
-out:
 	/* remember the reported uuc */
 	chip->last_uuc_uah = uuc_reported;
 
-	/* remember cc_uah */
-	chip->last_cc_uah = cc_uah;
-
-	/* remember this time */
-	chip->t = now;
+	if (firsttime == 1) {
+		/* uuc calculation for the first time is done */
+		firsttime = 0;
+	}
 
 	return uuc_reported;
 }
@@ -1298,7 +1434,9 @@ static void calculate_soc_params(struct pm8921_bms_chip *chip,
 						int *unusable_charge_uah,
 						int *remaining_charge_uah,
 						int *cc_uah,
-						int *rbatt)
+						int *rbatt,
+						int *iavg_ua,
+						int *delta_time_us)
 {
 	int soc_rbatt;
 
@@ -1324,10 +1462,11 @@ static void calculate_soc_params(struct pm8921_bms_chip *chip,
 		soc_rbatt = 0;
 	*rbatt = get_rbatt(chip, soc_rbatt, batt_temp);
 
+	calculate_iavg_ua(chip, *cc_uah, iavg_ua, delta_time_us);
+
 	*unusable_charge_uah = calculate_unusable_charge_uah(chip, *rbatt,
 					*fcc_uah, *cc_uah, soc_rbatt,
-					batt_temp,
-					chargecycles);
+					batt_temp, chargecycles, *iavg_ua);
 	pr_debug("UUC = %uuAh\n", *unusable_charge_uah);
 }
 
@@ -1341,19 +1480,43 @@ static int calculate_real_fcc_uah(struct pm8921_bms_chip *chip,
 	int cc_uah;
 	int real_fcc_uah;
 	int rbatt;
+	int iavg_ua;
+	int delta_time_us;
 
 	calculate_soc_params(chip, raw, batt_temp, chargecycles,
 						&fcc_uah,
 						&unusable_charge_uah,
 						&remaining_charge_uah,
 						&cc_uah,
-						&rbatt);
+						&rbatt,
+						&iavg_ua,
+						&delta_time_us);
 
 	real_fcc_uah = remaining_charge_uah - cc_uah;
 	*ret_fcc_uah = fcc_uah;
 	pr_debug("real_fcc = %d, RC = %d CC = %d fcc = %d\n",
 			real_fcc_uah, remaining_charge_uah, cc_uah, fcc_uah);
 	return real_fcc_uah;
+}
+
+/* L0/L1A, bms_soc_averaging
+ * BMS averaging function
+ * 2012-04-22, hyemin.cho@lge.com
+ */
+int cal_rnd_avg(int *soc_value)
+{
+	 int sum=0;
+	 int avr=0;
+	 int i;
+
+	 for(i = 0; i<I_MAX; i++)
+	 {
+		sum += soc_value[i];
+	 }
+
+	 avr = ((sum/I_MAX)*10+5)/10;
+
+	 return avr;
 }
 
 static int bound_soc(int soc)
@@ -1471,13 +1634,34 @@ static int calculate_state_of_charge(struct pm8921_bms_chip *chip,
 	int remaining_charge_uah, soc;
 	int cc_uah;
 	int rbatt;
+	int iavg_ua;
+	int delta_time_us;
+
+/* L0/L1A, bms_soc_averaging
+* BMS averaging variable
+* 2012-04-22, hyemin.cho@lge.com
+*/
+	static int	soc_buf[I_MAX]={0,};
+	static int	idxBuf = 0;
+	int			idxsoc = 0;
+	int			avgSOC = 0;
+
+
+	//2012-05-08, junsin.park@lge.com for bms test
+	int ibat=0; int vbatt=0;
+	int comp_soc=0; int org_soc=0; int adj_soc=0;
+	pm8921_bms_get_battery_current(&ibat);
+	get_battery_uvolts(chip, &vbatt);
+	//2012-05-08, junsin.park@lge.com for bms test
 
 	calculate_soc_params(chip, raw, batt_temp, chargecycles,
 						&fcc_uah,
 						&unusable_charge_uah,
 						&remaining_charge_uah,
 						&cc_uah,
-						&rbatt);
+						&rbatt,
+						&iavg_ua,
+						&delta_time_us);
 
 	/* calculate remaining usable charge */
 	remaining_usable_charge_uah = remaining_charge_uah
@@ -1493,6 +1677,9 @@ static int calculate_state_of_charge(struct pm8921_bms_chip *chip,
 		soc = (remaining_usable_charge_uah * 100)
 			/ (fcc_uah - unusable_charge_uah);
 	}
+
+	//2012-05-08, junsin.park@lge.com for bms test
+	org_soc = soc;
 
 	if (soc > 100)
 		soc = 100;
@@ -1521,6 +1708,47 @@ static int calculate_state_of_charge(struct pm8921_bms_chip *chip,
 	soc = adjust_soc(chip, soc, batt_temp, rbatt,
 					fcc_uah, unusable_charge_uah, cc_uah);
 
+	//2012-05-08, junsin.park@lge.com for bms test
+	adj_soc = soc;
+
+	/* 5% Compensation of SOC Value, need to verify.
+	 * 2012-04-09, junsin.park@lge.com 
+	 */
+	soc = (soc*100/95);
+
+	//2012-05-08, junsin.park@lge.com for bms test
+	comp_soc = soc;
+
+	// average of last 30 measured comp_soc value
+	if ( cntSOC == 0)//access once
+	{
+		for(idxsoc=0; idxsoc<I_MAX; idxsoc++)
+		{
+			soc_buf[idxsoc] = soc;
+		}
+		avgSOC = soc;
+		cntSOC = I_MAX;
+		idxBuf = 1;
+	}
+	else
+	{
+		if (idxBuf >= I_MAX )
+		{
+			idxBuf = 0;
+		}
+		soc_buf[idxBuf] = soc;
+		idxBuf++;
+
+		avgSOC = cal_rnd_avg(soc_buf);
+	}
+
+	soc = avgSOC;
+
+	if (soc > 100)
+		soc = 100;
+	pr_debug("SOC = %u%%\n", soc);
+
+
 	if (last_soc == -EINVAL || soc <= last_soc) {
 		last_soc = soc;
 	} else {
@@ -1529,7 +1757,11 @@ static int calculate_state_of_charge(struct pm8921_bms_chip *chip,
 		 * the device must be charging for reporting a higher soc, if
 		 * not ignore this soc and continue reporting the last_soc
 		 */
+#ifdef CONFIG_LGE_PM
+		if (the_chip->start_percent != -EINVAL || chg_plugged_in())
+#else
 		if (the_chip->start_percent != -EINVAL)
+#endif
 			last_soc = soc;
 		else
 			pr_debug("soc = %d reporting last_soc = %d\n", soc,
@@ -1537,6 +1769,10 @@ static int calculate_state_of_charge(struct pm8921_bms_chip *chip,
 	}
 
 	pr_debug("Reported SOC = %u%%\n", last_soc);
+
+	//2012-05-08, junsin.park@lge.com for bms test
+	printk("[BMS] ORG_SOC=%d, ADJ_SOC=%d, COMP_SOC=%d(%d), LAST_SOC=%d, BAT_TEMP=%d, OCV=%d, RBATT=%d, FCC=%d, RC=%d, CC=%d, UUC=%d, RUC=%d, VBATT=%d, IBAT=%d \n", org_soc, adj_soc, comp_soc, avgSOC,last_soc, batt_temp, raw->last_good_ocv_uv, rbatt, fcc_uah, remaining_charge_uah, cc_uah, unusable_charge_uah, remaining_usable_charge_uah, vbatt, ibat);
+
 	return last_soc;
 }
 #define MIN_DELTA_625_UV	1000
@@ -1565,8 +1801,11 @@ static void calib_hkadc(struct pm8921_bms_chip *chip)
 		return;
 	}
 	voltage = xoadc_reading_to_microvolt(result.adc_code);
-
+#ifdef CONFIG_LGE_PM
+	usb_chg = chg_plugged_in();
+#else /* QCT original */
 	usb_chg = usb_chg_plugged_in();
+#endif
 	pr_debug("result 0.625V = 0x%x, voltage = %duV adc_meas = %lld "
 				"usb_chg = %d\n",
 				result.adc_code, voltage, result.measurement,
@@ -1615,6 +1854,70 @@ static void calibrate_ccadc_work(struct work_struct *work)
 			round_jiffies_relative(msecs_to_jiffies
 			(chip->calib_delay_ms)));
 }
+
+/* L0/L1A, bms_soc_logging
+ * Workaround for BMS error Debugging
+ * 2012-03-30, hyemin.cho@lge.com
+ */
+#ifdef BMS_SOC_INFO
+static int get_prop_batt_temp(struct pm8921_bms_chip *chip)
+{
+	int rc;
+	struct pm8xxx_adc_chan_result result;
+
+	rc = pm8xxx_adc_read(chip->batt_temp_channel, &result);
+	if (rc) {
+		pr_err("error reading adc channel = %d, rc = %d\n",
+					chip->vbat_channel, rc);
+		return rc;
+	}
+	pr_debug("batt_temp phy = %lld meas = 0x%llx\n", result.physical,
+						result.measurement);
+	if (result.physical > 680)
+		pr_err("BATT_TEMP= %d > 68degC, device will be shutdown\n",
+							(int) result.physical);
+
+	return (int)result.physical;
+}
+
+static int get_prop_batt_current(struct pm8921_bms_chip *chip)
+{
+	int result_ua, rc;
+
+	rc = pm8921_bms_get_battery_current(&result_ua);
+	if (rc == -ENXIO) {
+		rc = pm8xxx_ccadc_get_battery_current(&result_ua);
+	}
+
+	if (rc) {
+		pr_err("unable to get batt current rc = %d\n", rc);
+		return rc;
+	} else {
+		return result_ua;
+	}
+}
+
+static void bms_soc_monitor_work(struct work_struct *work)
+{
+	struct pm8921_bms_chip *chip = container_of(work,
+				struct pm8921_bms_chip, bms_soc_work.work);
+
+	int vbatt, soc, batt_temp, ibat;
+
+	soc = pm8921_bms_get_percent_charge();
+	batt_temp = get_prop_batt_temp(chip)/10;
+	ibat = get_prop_batt_current(chip);
+	get_battery_uvolts(chip, &vbatt);
+
+	printk(KERN_INFO"[BMS_SOC_INFO] soc=%d%% vbatt=%dV temp=%d ibat=%dmA\n", soc, vbatt/1000, batt_temp, ibat/1000);
+
+	schedule_delayed_work(&chip->bms_soc_work,
+			round_jiffies_relative(msecs_to_jiffies
+			(BMS_SOC_INFORM_TIME)));
+	pm8921_charger_force_update_batt_psy();
+}
+#endif
+
 
 int pm8921_bms_get_vsense_avg(int *result)
 {
@@ -1701,6 +2004,8 @@ int pm8921_bms_get_rbatt(void)
 	int remaining_charge_uah;
 	int cc_uah;
 	int rbatt;
+	int iavg_ua;
+	int delta_time_us;
 
 	if (!the_chip) {
 		pr_err("called before initialization\n");
@@ -1726,7 +2031,9 @@ int pm8921_bms_get_rbatt(void)
 						&unusable_charge_uah,
 						&remaining_charge_uah,
 						&cc_uah,
-						&rbatt);
+						&rbatt,
+						&iavg_ua,
+						&delta_time_us);
 	mutex_unlock(&the_chip->last_ocv_uv_mutex);
 
 	return rbatt;
@@ -2031,7 +2338,13 @@ static int pm8921_bms_suspend(struct device *dev)
 	int fcc_uah;
 	int remaining_charge_uah;
 	int cc_uah;
-
+#ifdef BMS_SOC_INFO
+	cancel_delayed_work(&chip->bms_soc_work);
+#endif
+#ifdef CONFIG_LGE_PM
+	cntSOC = 0;
+	pr_debug("[BMS] Reset cntSOC = %d \n", cntSOC);
+#endif
 	chip->batt_temp_suspend = 0;
 	rc = pm8xxx_adc_read(chip->batt_temp_channel, &result);
 	if (rc) {
@@ -2075,7 +2388,9 @@ static int pm8921_bms_resume(struct device *dev)
 	int expected_rbatt;
 	int scalefactor;
 	int delta_rbatt;
-
+#ifdef BMS_SOC_INFO
+	schedule_delayed_work(&chip->bms_soc_work, BMS_SOC_INFORM_TIME/20);
+#endif
 	read_rbatt_params_raw(chip, &raw);
 	rbatt = calculate_rbatt_resume(chip, &raw);
 
@@ -2142,7 +2457,11 @@ static void check_initial_ocv(struct pm8921_bms_chip *chip)
 	 */
 	ocv_uv = 0;
 	pm_bms_read_output_data(chip, LAST_GOOD_OCV_VALUE, &ocv_raw);
+#ifdef CONFIG_LGE_PM
+	usb_chg = chg_plugged_in();
+#else /* QCT original */
 	usb_chg = usb_chg_plugged_in();
+#endif
 	rc = convert_vbatt_raw_to_uv(chip, usb_chg, ocv_raw, &ocv_uv);
 	if (rc || ocv_uv == 0) {
 		rc = adc_based_ocv(chip, &ocv_uv);
@@ -2155,6 +2474,7 @@ static void check_initial_ocv(struct pm8921_bms_chip *chip)
 	pr_debug("ocv_uv = %d last_ocv_uv = %d\n", ocv_uv, chip->last_ocv_uv);
 }
 
+#if !defined (CONFIG_LGE_PM)
 static int64_t read_battery_id(struct pm8921_bms_chip *chip)
 {
 	int rc;
@@ -2170,6 +2490,7 @@ static int64_t read_battery_id(struct pm8921_bms_chip *chip)
 						result.measurement);
 	return result.adc_code;
 }
+#endif
 
 #define PALLADIUM_ID_MIN	0x7F40
 #define PALLADIUM_ID_MAX	0x7F5A
@@ -2177,6 +2498,59 @@ static int64_t read_battery_id(struct pm8921_bms_chip *chip)
 #define DESAY_5200_ID_MAX	0x802F
 static int set_battery_data(struct pm8921_bms_chip *chip)
 {
+#if defined(CONFIG_LGE_PM)
+#if defined(CONFIG_MACH_MSM8960_L0)
+	if (lge_get_board_revno() < HW_REV_D)
+	{
+		pr_info("[BMS] Battery profile data is set to LGC_BL44JS_1700 \n");
+		chip->fcc = LGC_BL44JS_1700_data.fcc;
+		chip->fcc_temp_lut = LGC_BL44JS_1700_data.fcc_temp_lut;
+		chip->fcc_sf_lut = LGC_BL44JS_1700_data.fcc_sf_lut;
+		chip->pc_temp_ocv_lut = LGC_BL44JS_1700_data.pc_temp_ocv_lut;
+		chip->pc_sf_lut = LGC_BL44JS_1700_data.pc_sf_lut;
+		chip->rbatt_sf_lut = LGC_BL44JS_1700_data.rbatt_sf_lut;
+		chip->default_rbatt_mohm = LGC_BL44JS_1700_data.default_rbatt_mohm;
+		chip->delta_rbatt_mohm = LGC_BL44JS_1700_data.delta_rbatt_mohm;
+		return 0;
+	}
+	else
+	{
+		pr_info("[BMS] Battery profile data is set to LGC_BL44JH_1700 \n");
+		chip->fcc = LGC_BL44JH_1700_data.fcc;
+		chip->fcc_temp_lut = LGC_BL44JH_1700_data.fcc_temp_lut;
+		chip->fcc_sf_lut = LGC_BL44JH_1700_data.fcc_sf_lut;
+		chip->pc_temp_ocv_lut = LGC_BL44JH_1700_data.pc_temp_ocv_lut;
+		chip->pc_sf_lut = LGC_BL44JH_1700_data.pc_sf_lut;
+		chip->rbatt_sf_lut = LGC_BL44JH_1700_data.rbatt_sf_lut;
+		chip->default_rbatt_mohm = LGC_BL44JH_1700_data.default_rbatt_mohm;
+		chip->delta_rbatt_mohm = LGC_BL44JH_1700_data.delta_rbatt_mohm;
+		return 0;
+	}
+#elif defined(CONFIG_MACH_MSM8960_L2S)
+		pr_info("[BMS] Battery profile data is set to LGC_BL44JH_1700 \n");
+		chip->fcc = LGC_BL44JH_1700_data.fcc;
+		chip->fcc_temp_lut = LGC_BL44JH_1700_data.fcc_temp_lut;
+		chip->fcc_sf_lut = LGC_BL44JH_1700_data.fcc_sf_lut;
+		chip->pc_temp_ocv_lut = LGC_BL44JH_1700_data.pc_temp_ocv_lut;
+		chip->pc_sf_lut = LGC_BL44JH_1700_data.pc_sf_lut;
+		chip->rbatt_sf_lut = LGC_BL44JH_1700_data.rbatt_sf_lut;
+		chip->default_rbatt_mohm = LGC_BL44JH_1700_data.default_rbatt_mohm;
+		chip->delta_rbatt_mohm = LGC_BL44JH_1700_data.delta_rbatt_mohm;
+		return 0;
+#else	// L1A, D1L
+		pr_info("[BMS] Battery profile data is set to LGC_BL53QH_2000 \n");
+		chip->fcc = LGC_BL53QH_2000_data.fcc;
+		chip->fcc_temp_lut = LGC_BL53QH_2000_data.fcc_temp_lut;
+		chip->fcc_sf_lut = LGC_BL53QH_2000_data.fcc_sf_lut;
+		chip->pc_temp_ocv_lut = LGC_BL53QH_2000_data.pc_temp_ocv_lut;
+		chip->pc_sf_lut = LGC_BL53QH_2000_data.pc_sf_lut;
+		chip->rbatt_sf_lut = LGC_BL53QH_2000_data.rbatt_sf_lut;
+		chip->default_rbatt_mohm = LGC_BL53QH_2000_data.default_rbatt_mohm;
+		chip->delta_rbatt_mohm = LGC_BL53QH_2000_data.delta_rbatt_mohm;
+		return 0;
+#endif
+
+#else	/* QCT Original */
 	int64_t battery_id;
 
 	if (chip->batt_type == BATT_DESAY)
@@ -2192,6 +2566,23 @@ static int set_battery_data(struct pm8921_bms_chip *chip)
 
 	if (is_between(PALLADIUM_ID_MIN, PALLADIUM_ID_MAX, battery_id)) {
 		goto palladium;
+	}
+/* L0, Change Battery Profile
+*  Battery is changed from 4.20V to 4.35V after Rev.C
+*  2012-03-19, junsin.park@lge.com
+*/
+#if 0 /* Compile error on QCT1047 */
+#if defined(CONFIG_LGE_PM) && defined(CONFIG_MACH_MSM8960_L0)
+	else if (lge_get_board_revno() < HW_REV_D) {
+		chip->fcc = palladium_1500_data_2.fcc;
+		chip->fcc_temp_lut = palladium_1500_data_2.fcc_temp_lut;
+		chip->fcc_sf_lut = palladium_1500_data_2.fcc_sf_lut;
+		chip->pc_temp_ocv_lut = palladium_1500_data_2.pc_temp_ocv_lut;
+		chip->pc_sf_lut = palladium_1500_data_2.pc_sf_lut;
+		return 0;
+	}
+#endif
+#endif
 	} else if (is_between(DESAY_5200_ID_MIN, DESAY_5200_ID_MAX,
 				battery_id)) {
 		goto desay;
@@ -2208,11 +2599,11 @@ palladium:
 		chip->pc_temp_ocv_lut = palladium_1500_data.pc_temp_ocv_lut;
 		chip->pc_sf_lut = palladium_1500_data.pc_sf_lut;
 		chip->rbatt_sf_lut = palladium_1500_data.rbatt_sf_lut;
-		chip->default_rbatt_mohm
-				= palladium_1500_data.default_rbatt_mohm;
+		chip->default_rbatt_mohm = palladium_1500_data.default_rbatt_mohm;
 		chip->delta_rbatt_mohm = palladium_1500_data.delta_rbatt_mohm;
 		return 0;
 desay:
+
 		chip->fcc = desay_5200_data.fcc;
 		chip->fcc_temp_lut = desay_5200_data.fcc_temp_lut;
 		chip->pc_temp_ocv_lut = desay_5200_data.pc_temp_ocv_lut;
@@ -2221,6 +2612,7 @@ desay:
 		chip->default_rbatt_mohm = desay_5200_data.default_rbatt_mohm;
 		chip->delta_rbatt_mohm = desay_5200_data.delta_rbatt_mohm;
 		return 0;
+#endif
 }
 
 enum bms_request_operation {
@@ -2535,6 +2927,27 @@ restore_sbi_config:
 	return 0;
 }
 
+/* Add voltage sysfs node for lg power test in factory
+  * 2012-05-28, junsin.park@lge.com
+  */
+#ifdef CONFIG_LGE_PM
+ssize_t bms_show_vbatt(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int vbatt=0;
+	if (the_chip == NULL)
+		return snprintf(buf, PAGE_SIZE, "ERROR\n");
+
+	pm8921_charger_enable(0);
+	msleep(1000);
+	get_battery_uvolts(the_chip, &vbatt);
+	pm8921_charger_enable(1);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", vbatt);
+}
+DEVICE_ATTR(vbatt, 0444, bms_show_vbatt, NULL);
+#endif
+
+
 static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 {
 	int rc = 0;
@@ -2607,6 +3020,13 @@ static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 	the_chip = chip;
 	create_debugfs_entries(chip);
 
+/* Add voltage sysfs node for lg power test in factory
+  * 2012-05-28, junsin.park@lge.com
+  */
+#ifdef CONFIG_LGE_PM
+	rc = device_create_file(&pdev->dev, &dev_attr_vbatt);
+#endif
+
 	rc = read_ocv_trim(chip);
 	if (rc) {
 		pr_err("couldn't adjust ocv_trim rc= %d\n", rc);
@@ -2624,6 +3044,19 @@ static int __devinit pm8921_bms_probe(struct platform_device *pdev)
 	/* enable the vbatt reading interrupts for scheduling hkadc calib */
 	pm8921_bms_enable_irq(chip, PM8921_BMS_GOOD_OCV);
 	pm8921_bms_enable_irq(chip, PM8921_BMS_OCV_FOR_R);
+
+/* L0/L1A, bms_soc_logging
+ * Workaround for BMS error Debugging
+ * 2012-03-30, hyemin.cho@lge.com
+ */
+#ifdef BMS_SOC_INFO
+	INIT_DELAYED_WORK(&chip->bms_soc_work, bms_soc_monitor_work);
+	schedule_delayed_work(&chip->bms_soc_work, 0);
+#endif
+
+	INIT_DELAYED_WORK(&chip->uuc_timer_work, uuc_timer_work);
+	schedule_delayed_work(&chip->uuc_timer_work,
+					msecs_to_jiffies(UUC_TIMER_MS));
 
 	get_battery_uvolts(chip, &vbatt);
 	pr_info("OK battery_capacity_at_boot=%d volt = %d ocv = %d\n",
